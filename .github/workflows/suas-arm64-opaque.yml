@@ -1,0 +1,200 @@
+name: Opaque public ARM64 site build
+run-name: suas-arm64-${{ inputs.nonce }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        required: true
+        type: string
+      nonce:
+        required: true
+        type: string
+      recipient:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: suas-arm64-${{ inputs.nonce }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'q8z7/ci' && github.ref == 'refs/heads/main' && github.actor == 'eschan145-alt' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    env:
+      CI_NONCE: ${{ inputs.nonce }}
+      CI_SOURCE_SHA: ${{ inputs.source_sha }}
+      CI_RECIPIENT: ${{ inputs.recipient }}
+      SUAS_BUILD_CHANNEL: prod
+    steps:
+      - name: Validate public-only request and retrieve exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CI_NONCE" =~ ^[a-f0-9]{24}$ ]]
+          [[ "$CI_SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$CI_RECIPIENT" =~ ^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$ ]]
+          [[ "$(uname -m)" == aarch64 ]]
+          mkdir -p source
+          curl -fSL --retry 3 --max-time 120 \
+            "https://codeload.github.com/SUAS-STEM/suas-site/tar.gz/$CI_SOURCE_SHA" \
+            | tar -xz --no-same-owner --no-same-permissions --strip-components=1 -C source
+          test -f source/package-lock.json
+
+      - name: Select preinstalled Node 24 toolcache on GitHub ARM64 runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          for candidate in /opt/hostedtoolcache/node/24.*/arm64/bin; do
+            if [[ -x "$candidate/node" ]]; then
+              echo "$candidate" >> "$GITHUB_PATH"
+              export PATH="$candidate:$PATH"
+              break
+            fi
+          done
+          node -p 'process.versions.node'
+          node -e 'if(Number(process.versions.node.split(".")[0])!==24)process.exit(1)'
+
+      - name: Compile public production site without repository secrets
+        shell: bash
+        working-directory: source
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+        run: |
+          set -euo pipefail
+          unset GH_TOKEN GITHUB_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
+          npm ci --no-audit --no-fund
+          npm audit --omit=dev --audit-level=high
+          npm run build
+          test -s .next/standalone/server.js
+          test -d .next/standalone/public
+          test -d .next/standalone/.next/static
+          test ! -e .next/standalone/internal
+          find .next/standalone -type f -name '*.map' -delete
+          if find .next/standalone -type f \( -name '.env' -o -name '.env.*' \) -print -quit | grep -q .; then
+            echo 'Refusing build output containing environment configuration' >&2
+            exit 1
+          fi
+
+      - name: Smoke test public-only ARM64 standalone result
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source/.next/standalone
+          NODE_ENV=production HOSTNAME=127.0.0.1 PORT=3199 \
+            SPONSOR_DB_PATH="$RUNNER_TEMP/suas-synthetic.db" node server.js \
+            >"$RUNNER_TEMP/suas-site-smoke.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for i in $(seq 1 45); do
+            if curl -fsS --max-time 2 http://127.0.0.1:3199/api/health >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS --max-time 5 http://127.0.0.1:3199/ >/dev/null
+          curl -fsS --max-time 5 http://127.0.0.1:3199/ssgcs >/dev/null
+          [[ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3199/storage/security-probe)" == 404 ]]
+          [[ "$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:3199/api/wiki-image?file=breakout-board-pinout.jpeg')" == 404 ]]
+
+      - name: Encrypt full standalone archive before any upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends age
+          mkdir -p sealed
+          python3 - <<'PY'
+          import json,os,pathlib,subprocess
+          record={'schemaVersion':1,'sourceCommit':os.environ['CI_SOURCE_SHA'],
+                  'channel':'prod','buildWorkflowCommit':os.environ['GITHUB_SHA'],
+                  'buildRunId':int(os.environ['GITHUB_RUN_ID']),
+                  'buildRunAttempt':int(os.environ['GITHUB_RUN_ATTEMPT']),
+                  'nodeVersion':subprocess.check_output(['node','--version'],text=True).strip()}
+          pathlib.Path('source/.next/standalone/BUILD-METADATA.json').write_text(
+              json.dumps(record,sort_keys=True)+'\n')
+          PY
+          tar -C source/.next/standalone -czf "$RUNNER_TEMP/suas-standalone.tar.gz" .
+          age -r "$CI_RECIPIENT" -o sealed/payload.age "$RUNNER_TEMP/suas-standalone.tar.gz"
+          rm -f "$RUNNER_TEMP/suas-standalone.tar.gz"
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib
+          ciphertext=pathlib.Path('sealed/payload.age')
+          with ciphertext.open('rb') as fd:
+              digest=hashlib.file_digest(fd,'sha256').hexdigest()
+          meta={'version':1,'nonce':os.environ['CI_NONCE'],
+                'source_sha':os.environ['CI_SOURCE_SHA'],
+                'recipient':os.environ['CI_RECIPIENT'],
+                'cipher_sha256':digest,'cipher_bytes':ciphertext.stat().st_size}
+          pathlib.Path('sealed/metadata.json').write_text(json.dumps(meta,sort_keys=True)+'\n')
+          print('Encrypted ARM64 standalone archive prepared; plaintext deleted')
+          PY
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: suas-arm64-sealed
+          path: sealed/
+          if-no-files-found: error
+          retention-days: 1
+
+  attest:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CI_NONCE: ${{ inputs.nonce }}
+      CI_SOURCE_SHA: ${{ inputs.source_sha }}
+      CI_RECIPIENT: ${{ inputs.recipient }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: suas-arm64-sealed
+          path: sealed/
+
+      - name: Authenticate ciphertext and request GitHub-signed OIDC proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,urllib.parse,urllib.request
+          folder=pathlib.Path('sealed')
+          assert sorted(x.name for x in folder.iterdir())==['metadata.json','payload.age']
+          metadata=json.loads((folder/'metadata.json').read_text())
+          assert metadata['version']==1
+          assert metadata['nonce']==os.environ['CI_NONCE']
+          assert metadata['source_sha']==os.environ['CI_SOURCE_SHA']
+          assert metadata['recipient']==os.environ['CI_RECIPIENT']
+          with (folder/'payload.age').open('rb') as fd:
+              digest=hashlib.file_digest(fd,'sha256').hexdigest()
+          assert metadata['cipher_sha256']==digest
+          assert metadata['cipher_bytes']==(folder/'payload.age').stat().st_size
+          fields=('suas-arm64-v1',metadata['nonce'],metadata['source_sha'],
+                  metadata['recipient'],digest)
+          audience='suas-arm64-v1:'+hashlib.sha256('\0'.join(fields).encode()).hexdigest()
+          url=os.environ['ACTIONS_ID_TOKEN_REQUEST_URL']
+          parsed=urllib.parse.urlsplit(url)
+          assert parsed.scheme=='https' and parsed.hostname.endswith('.actions.githubusercontent.com')
+          sep='&' if parsed.query else '?'
+          request=urllib.request.Request(url+sep+'audience='+urllib.parse.quote(audience,safe=''),
+              headers={'Authorization':'Bearer '+os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
+          with urllib.request.urlopen(request,timeout=20) as response:
+              proof=json.load(response)['value']
+          assert isinstance(proof,str) and 100<len(proof)<16000
+          (folder/'result.oidc').write_text(proof+'\n')
+          print('GitHub-signed ciphertext digest authenticated on isolated hosted runner')
+          PY
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: suas-arm64-attested
+          path: sealed/
+          if-no-files-found: error
+          retention-days: 2
