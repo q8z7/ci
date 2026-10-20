@@ -9,6 +9,11 @@ on:
         type: choice
         default: windows
         options: [windows, linux]
+      windows_image:
+        required: false
+        type: choice
+        default: windows-2022
+        options: [windows-2022, windows-2025, windows-latest]
       nonce:
         required: true
         type: string
@@ -34,10 +39,10 @@ concurrency:
 
 jobs:
   encrypted-msvc:
-    if: github.repository == 'q8z7/ci' && github.ref == 'refs/heads/main' && github.actor == 'eschan145-alt' && github.event_name == 'workflow_dispatch' && contains(fromJSON('["windows","linux"]'), inputs.platform)
+    if: github.repository == 'q8z7/ci' && github.ref == 'refs/heads/main' && github.actor == 'eschan145-alt' && github.event_name == 'workflow_dispatch' && contains(fromJSON('["windows","linux"]'), inputs.platform) && contains(fromJSON('["windows-2022","windows-2025","windows-latest"]'), inputs.windows_image)
     name: opaque-${{ inputs.platform }}
-    runs-on: ${{ inputs.platform == 'linux' && 'ubuntu-24.04' || 'windows-2022' }}
-    timeout-minutes: 35
+    runs-on: ${{ inputs.platform == 'linux' && 'ubuntu-24.04' || inputs.windows_image }}
+    timeout-minutes: 105
     permissions:
       contents: write
       id-token: write
@@ -49,6 +54,7 @@ jobs:
       CI_WORKER_SHA256: ${{ inputs.worker_bundle_sha256 }}
       PYTHONDONTWRITEBYTECODE: '1'
       CI_PLATFORM: ${{ inputs.platform }}
+      CI_WINDOWS_IMAGE: ${{ inputs.windows_image }}
     steps:
       - name: Install pinned and checksum-verified age CLI
         shell: pwsh
@@ -60,6 +66,9 @@ jobs:
               $env:CI_WORKER_SHA256 -cnotmatch '^[a-f0-9]{64}$' -or
               $env:CI_OUTPUT_RECIPIENT -cnotmatch '^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$') {
             throw 'Invalid reviewed encrypted MSVC dispatch metadata'
+          }
+          if ($env:CI_WINDOWS_IMAGE -cnotmatch '^(windows-2022|windows-2025|windows-latest)$') {
+            throw 'Unreviewed Windows hosted image selection'
           }
           if (($env:CI_PLATFORM -ceq 'windows' -and $env:RUNNER_OS -cne 'Windows') -or
               ($env:CI_PLATFORM -ceq 'linux' -and $env:RUNNER_OS -cne 'Linux') -or
