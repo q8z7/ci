@@ -200,9 +200,16 @@ jobs:
             $zip = [IO.Compression.ZipFile]::OpenRead($workerZip)
             try {
               $names = @($zip.Entries | ForEach-Object FullName | Sort-Object)
-              $expected = @('manifest.json','tools/__init__.py',
-                            'tools/opaque_runner.py','tools/opaque_staged_runner.py') | Sort-Object
-              if (($names -join '|') -cne ($expected -join '|') -or
+              # Accept ONLY the original three-file signed private worker or
+              # its reviewed public-Release-cache extension. Do not loosen the
+              # explicit member inventory for arbitrary packages. The whole
+              # archive must still match the privately authenticated SHA-256.
+              $legacy = @('manifest.json','tools/__init__.py',
+                          'tools/opaque_runner.py','tools/opaque_staged_runner.py') | Sort-Object
+              $cached = @($legacy + 'tools/release_dependency_cache.py') | Sort-Object
+              $inventory = $names -join '|'
+              if (($inventory -cne ($legacy -join '|') -and
+                   $inventory -cne ($cached -join '|')) -or
                   @($zip.Entries | Where-Object { $_.Length -gt 200000 }).Count -ne 0) {
                 throw 'Unexpected private worker bundle contents'
               }
